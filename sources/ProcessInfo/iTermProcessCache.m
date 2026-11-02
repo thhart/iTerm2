@@ -21,6 +21,12 @@ NSNotificationName const iTermProcessCacheForegroundJobAncestorsDidChangeNotific
 NSString *const iTermProcessCacheForegroundJobAncestorsPidKey = @"pid";
 NSString *const iTermProcessCacheForegroundJobAncestorsKey = @"ancestors";
 
+// Efficiency patch: nothing needs the full process table more often than this
+// unless a process monitor reports a real change or a caller asks on demand
+// (requestImmediateUpdate*, which bypass this limit).
+static const NSTimeInterval kPollingInterval = 5;
+static const NSTimeInterval kBackgroundPollingInterval = 30;
+
 @interface iTermProcessCache()
 
 // Maps process id to deepest foreground job. _lockQueue
@@ -42,7 +48,8 @@ NSString *const iTermProcessCacheForegroundJobAncestorsKey = @"ancestors";
     NSMutableDictionary<NSNumber *, iTermProcessMonitor *> *_trackedPidsLQ;  // _lockQueue
     NSMutableArray<void (^)(void)> *_blocksLQ; // _lockQueue
     BOOL _needsUpdateFlagLQ;  // _lockQueue
-    iTermRateLimitedUpdate *_rateLimit;  // Main queue. keeps updateIfNeeded from eating all the CPU
+    iTermRateLimitedUpdate *_rateLimit;  // Main queue. keeps polling-style setNeedsUpdate: requests (PTYSession title/display ticks) from eating all the CPU. Slow: a full process table walk is expensive.
+    iTermRateLimitedUpdate *_forcedRateLimit;  // Main queue. Used when a tracked process actually changed (fork/exec/exit); stays responsive.
     NSMutableIndexSet *_dirtyPIDsLQ;  // _lockQueue
     // Caches each tracked root pid's controlling tty (its stdio device rdev) so we
     // derive it just once per session rather than every update. The tty doesn't
@@ -103,7 +110,9 @@ NSString *const iTermProcessCacheForegroundJobAncestorsKey = @"ancestors";
 - (void)finishInitialization {
     // Perform main-thread-only initialization.
     _rateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"Process cache"
-                                              minimumInterval:0.5];
+                                              minimumInterval:kPollingInterval];
+    _forcedRateLimit = [[iTermRateLimitedUpdate alloc] initWithName:@"Process cache (process changed)"
+                                                    minimumInterval:0.5];
     [self setNeedsUpdate:YES];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(applicationDidBecomeActive:)
@@ -290,8 +299,8 @@ NSString *const iTermProcessCacheForegroundJobAncestorsKey = @"ancestors";
     if (!wasForced) {
         dispatch_async(dispatch_get_main_queue(), ^{
             DLog(@"Forcing update");
-            [self->_rateLimit performRateLimitedSelector:@selector(updateIfNeeded) onTarget:self withObject:nil];
-            [self->_rateLimit performWithinDuration:0.0167];
+            [self->_forcedRateLimit performRateLimitedSelector:@selector(updateIfNeeded) onTarget:self withObject:nil];
+            [self->_forcedRateLimit performWithinDuration:0.0167];
             self.forcingLQ = NO;
         });
     }
@@ -560,13 +569,13 @@ NSString *const iTermProcessCacheForegroundJobAncestorsKey = @"ancestors";
 
 // Main queue
 - (void)applicationDidResignActive:(NSNotification *)notification {
-    _rateLimit.minimumInterval = 5;
+    _rateLimit.minimumInterval = kBackgroundPollingInterval;
 }
 
 // Main queue
 - (void)applicationDidBecomeActive:(NSNotification *)notification {
     RLog(@"Application did become active (process cache)");
-    _rateLimit.minimumInterval = 0.5;
+    _rateLimit.minimumInterval = kPollingInterval;
 }
 
 @end
